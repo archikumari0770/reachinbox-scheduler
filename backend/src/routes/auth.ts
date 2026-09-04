@@ -3,7 +3,7 @@ import axios from "axios";
 import { env } from "../config/env";
 import { queryOne, query } from "../db/client";
 import { User, Sender } from "../types";
-import { issueSessionCookie, clearSessionCookie, requireAuth, AuthedRequest } from "../middleware/auth";
+import { signSessionToken, requireAuth, AuthedRequest } from "../middleware/auth";
 import { getOrCreateDefaultEtherealCredentials } from "../services/mailer";
 
 const router = Router();
@@ -65,8 +65,13 @@ router.get("/google/callback", async (req, res) => {
       );
     }
 
-    issueSessionCookie(res, user!.id);
-    res.redirect(`${env.frontendUrl}/dashboard`);
+    // Hand the session off to the frontend as a URL parameter, rather than
+    // an httpOnly cookie — see middleware/auth.ts for why: cross-domain
+    // cookies get silently dropped by Chrome's Bounce Tracking Protection
+    // on this exact frontend->backend->Google->backend->frontend redirect
+    // chain, even with fully correct SameSite=None; Secure attributes.
+    const token = signSessionToken(user!.id);
+    res.redirect(`${env.frontendUrl}/auth/callback?token=${encodeURIComponent(token)}`);
   } catch (err: any) {
     console.error("[auth] Google OAuth failed:", err.response?.data || err.message);
     res.redirect(`${env.frontendUrl}/?error=oauth_failed`);
@@ -91,7 +96,9 @@ router.get("/me", requireAuth, async (req: AuthedRequest, res) => {
 });
 
 router.post("/logout", (req, res) => {
-  clearSessionCookie(res);
+  // No server-side session to clear anymore — the frontend simply discards
+  // the token from its local storage. This endpoint is kept for API shape
+  // consistency / in case a future version adds token revocation.
   res.json({ ok: true });
 });
 
