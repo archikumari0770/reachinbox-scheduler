@@ -29,8 +29,16 @@ export function signSessionToken(userId: string): string {
 }
 
 export function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  // Normal API calls from the frontend attach Authorization: Bearer <token>
+  // via the axios interceptor in lib/api.ts. Direct browser navigation (e.g.
+  // opening /admin/queues in a new tab to view the live BullMQ dashboard)
+  // can't attach a custom header at all, so we also accept the token as a
+  // ?token= query parameter as a fallback for that specific case.
   const header = req.headers.authorization;
-  const token = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
+  const headerToken = header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : undefined;
+  const queryToken = typeof req.query.token === "string" ? req.query.token : undefined;
+  const token = headerToken ?? queryToken;
+
   if (!token) return res.status(401).json({ error: "Not authenticated" });
   try {
     const payload = jwt.verify(token, env.jwtSecret) as { sub: string };

@@ -138,9 +138,16 @@ failures are logged and swallowed — search degrading doesn't take down email s
 
 ## 7. Live BullMQ dashboard
 
-`@bull-board/express` is mounted at `GET /admin/queues` (protected by the same session auth as
-the rest of the API), showing live job states — waiting, delayed, active, completed, failed —
+`@bull-board/express` is mounted at `GET /admin/queues` (protected by the same bearer-token auth
+as the rest of the API), showing live job states — waiting, delayed, active, completed, failed —
 for the `email-send` queue.
+
+Since this is a direct browser navigation rather than an API call made through the frontend's
+axios client, it can't attach an `Authorization` header the normal way. `requireAuth` falls back
+to accepting the token as a `?token=` query parameter for exactly this case. To view it: open
+your browser's DevTools console on the logged-in dashboard and run
+`localStorage.getItem('reachinbox_token')`, copy the value, and visit
+`https://your-backend-url/admin/queues?token=<paste>`.
 
 ---
 
@@ -161,7 +168,22 @@ for the `email-send` queue.
 docker compose up -d          # redis (AOF), postgres, elasticsearch
 ```
 
-### 2. Backend
+### 2. Set up Ethereal Email (fake SMTP)
+No account creation needed up front. On first boot, if `ETHEREAL_SMTP_USER`/`ETHEREAL_SMTP_PASS`
+are left blank in `.env`, the backend calls `nodemailer.createTestAccount()` and prints a fresh
+disposable inbox's credentials straight to the console, e.g.:
+```
+[ethereal] Created a fresh test SMTP account:
+  user: abcxyz123@ethereal.email
+  pass: somegeneratedpassword
+```
+Copy those two values into `backend/.env` as `ETHEREAL_SMTP_USER` / `ETHEREAL_SMTP_PASS` so the
+same inbox persists across restarts (otherwise a new throwaway account is minted every boot).
+Every sent email also gets a `preview_url` (visible as a "preview" link in the Sent tab) that
+opens the actual rendered email in Ethereal's web viewer — this is how you confirm a send
+really happened, since Ethereal never delivers to a real inbox.
+
+### 3. Backend
 ```bash
 cd backend
 cp .env.example .env          # fill in GOOGLE_CLIENT_ID/SECRET, SLACK_CLIENT_ID/SECRET, etc.
@@ -169,8 +191,11 @@ npm install
 npm run migrate               # creates tables
 npm run dev                   # http://localhost:4000
 ```
+This single command starts the Express API **and** the BullMQ worker together (see
+`src/index.ts` — `startEmailWorker()` runs in the same process as the HTTP server). There is no
+separate worker process to launch.
 
-### 3. Frontend
+### 4. Frontend
 ```bash
 cd frontend
 cp .env.local.example .env.local
@@ -183,6 +208,38 @@ Open `http://localhost:3000`, sign in with Google, connect Slack (optional), com
 dashboard. Visit `http://localhost:4000/admin/queues` for the live BullMQ view.
 
 ---
+
+## Features implemented
+
+### Backend
+| Requirement | Implementation |
+|---|---|
+| Scheduler (no cron) | BullMQ delayed jobs, `queue/emailQueue.ts` — `queue.add(name, data, { delay, jobId })` |
+| Persistence across restarts | Redis AOF persistence + boot-time reconciler (`queue/reconcile.ts`) that re-attaches any Postgres row still `status='scheduled'` to the queue at its original time |
+| Idempotency / no duplicate sends | Deterministic `jobId = email_jobs.id` (BullMQ dedupes by ID) + a DB-level claim (`UPDATE ... WHERE status='scheduled'`) before any send is attempted |
+| Worker concurrency | Configurable via `WORKER_CONCURRENCY` (`queue/worker.ts`, `Worker(..., { concurrency })`) |
+| Min delay between sends | BullMQ limiter (`{ limiter: { max: 1, duration: MIN_DELAY_BETWEEN_SENDS_MS } }`) |
+| Hourly rate limit, per sender | Redis atomic `INCR`/`EXPIRE` counter, safe across multiple worker processes (`queue/rateLimiter.ts`) |
+| Rate-limited jobs rescheduled, not dropped | `job.moveToDelayed()` + `DelayedError` — the job re-delays itself to the next hour window under the same identity |
+| Slack notification on rate-limit hit | Real Slack OAuth v2 flow + live `POST` to the stored incoming webhook (`services/slackNotifier.ts`), silently no-ops if not connected |
+| Search (Elasticsearch) | Idempotent upsert on every status change + `multi_match` search endpoint (`services/elasticsearch.ts`) |
+| Live queue dashboard | `@bull-board/express` mounted at `/admin/queues` |
+| Google OAuth login | Manual OAuth2 code exchange against Google's token/userinfo endpoints (`routes/auth.ts`); session handed to the frontend as a bearer token, not a cookie — see "Hosting notes" below for why |
+| Multi-sender data model | `senders` table supports several senders per tenant (UI currently wires up one default sender — see trade-offs) |
+
+### Frontend
+| Requirement | Implementation |
+|---|---|
+| Google login | `pages/index.tsx` → redirects to backend `/api/auth/google`; backend hands session back as a bearer token via `pages/auth/callback.tsx`, stored in `localStorage` and attached as `Authorization: Bearer <token>` on every API call (`lib/api.ts`) |
+| Dashboard header (name, email, avatar, logout) | `components/Header.tsx` |
+| Scheduled / Sent tabs | `pages/dashboard.tsx`, backed by `GET /api/emails/scheduled` and `/sent`, polled every 8s |
+| Compose modal (subject, body, CSV upload, recipient count preview, start time, delay, hourly limit) | `components/ComposeModal.tsx` |
+| Loading states | Skeleton rows (`components/StatusUi.tsx` → `TableSkeleton`) |
+| Empty states | `EmptyState` component, shown when a tab has zero rows |
+| Error handling | Inline error banners in the compose modal on failed submissions |
+| Slack connect/disconnect UI | Badge + button in `Header.tsx`, wired to backend OAuth routes |
+
+
 
 ## Key environment variables (backend `.env`)
 
@@ -199,7 +256,58 @@ dashboard. Visit `http://localhost:4000/admin/queues` for the live BullMQ view.
 | `SESSION_SECRET` / `JWT_SECRET` | auth signing | — |
 | `FRONTEND_URL` | for OAuth redirects & CORS | `http://localhost:3000` |
 
-## Trade-offs & what I'd do next with more time
+## Hosting notes (deployed on Railway + Vercel)
+
+Beyond local Docker Compose, this was also deployed live — frontend on Vercel, backend +
+Postgres + Redis on Railway. Two real, non-obvious issues came up that are worth documenting
+honestly, since they're exactly the kind of thing that only surfaces once code leaves
+`localhost`:
+
+**1. Cross-domain session cookies get silently dropped by Chrome's Bounce Tracking Protection.**
+With frontend and backend on two separate subdomains (e.g. `*.vercel.app` and `*.up.railway.app`
+— both are on the public suffix list, so browsers treat them as fully different sites, not
+subdomains of one site), the natural approach is an `httpOnly` cookie with
+`SameSite=None; Secure`. That correctly gets *set* by the server — but modern Chrome (especially
+Incognito) applies Bounce Tracking Protection, which refuses to *persist* cookies from a domain
+that only ever appears as a redirect intermediary in a navigation chain
+(`frontend → backend → Google → backend → frontend`). The backend never gets treated as a
+genuine first-party site, so its cookie is silently discarded regardless of correct
+`SameSite`/`Secure` attributes — no error, no console warning, it just never shows up in
+`document.cookie` or DevTools' Application → Cookies panel.
+
+The fix: session is handed off explicitly as a **bearer token** instead. After Google OAuth
+completes, the backend redirects to `${FRONTEND_URL}/auth/callback?token=<jwt>` rather than
+setting a cookie. The frontend's `/auth/callback` page reads the token from the URL, stores it
+in `localStorage`, and an axios interceptor (`lib/api.ts`) attaches it as
+`Authorization: Bearer <token>` on every subsequent request. This sidesteps cross-site cookie
+restrictions entirely, since it's an explicit, visible handoff rather than implicit browser
+cookie state that anti-tracking heuristics can quietly interfere with. (Locally, where frontend
+and backend just run on different `localhost` ports, cross-site cookies would actually have
+worked fine — this only bites once the two halves are on genuinely different registrable
+domains.)
+
+**2. Railway's free tier blocks outbound SMTP entirely.** Ports 25, 465, and 587 are blocked by
+default on Railway's Free/Trial/Hobby plans specifically to prevent spam abuse — this is
+documented, deliberate platform policy, not a bug. Every send attempt from the live Railway
+deployment fails with `Connection timeout`, even though credentials, DNS, and the code path are
+all correct (confirmed by the exact same code sending successfully in local Docker dev, where
+nothing blocks the connection).
+
+**Decision made here:** rather than switch away from Ethereal (which the assignment explicitly
+calls for) or move hosting providers again, the live deployment intentionally accepts that email
+*sending* only works in local/Docker dev — everything else (Google login, the dashboard,
+scheduling, Slack OAuth and live rate-limit alerts, search) works identically on the live URLs.
+Scheduled emails on the live deployment will sit in "Scheduled" and then flip to "Failed" with a
+`Connection timeout` error once the worker attempts the send — that failure is expected and
+understood, not a defect. The demo video's actual send-and-verify segment is recorded against
+the local Docker setup, where this restriction doesn't apply.
+
+If continuing this into a real deployment, the two documented fixes are: move the backend to a
+host that doesn't block outbound SMTP on its free tier (e.g. Render), or switch to a
+transactional email provider with an HTTPS API (e.g. Resend, Mailgun) instead of raw SMTP —
+either sidesteps the port block, at the cost of moving off Ethereal specifically.
+
+
 
 - Multi-sender load balancing (round-robin across a pool of Ethereal senders per tenant) is
   modeled in the `senders` table but the compose UI only exposes a single default sender per
@@ -212,3 +320,23 @@ dashboard. Visit `http://localhost:4000/admin/queues` for the live BullMQ view.
 - CSV parsing happens twice today (client-side for the "N recipients detected" preview, and
   server-side again on submit for validation) — could be unified with a signed upload + a
   single server-side parse.
+
+## A real bug found and fixed during manual testing
+
+Worth documenting honestly: an early version of the rate-limit rescheduling logic tried to
+reschedule a rejected job by removing it and re-adding it under the same `jobId` from *within
+its own handler*. BullMQ won't let an active job mutate/remove itself that way — the removal
+silently no-ops, the handler then returns without error, and BullMQ marks the job "Completed"
+even though the email was never actually sent and nothing new was left in the queue to retry
+it. The email would then sit in Postgres as `status='scheduled'` forever, since the job that
+was supposed to wake it up again didn't actually get created.
+
+This was caught through manual testing (scheduling a batch with a very low hourly limit and
+watching some rows never leave "Scheduled"), root-caused via Bull-Board (jobs showed
+"Completed" in the queue while the database still said "scheduled" — the mismatch was the
+tell), and fixed by switching to BullMQ's intended pattern for this exact case:
+`job.moveToDelayed(timestamp, token)` followed by throwing `DelayedError`, which lets an active
+job safely re-delay *itself* under its own identity instead of trying to be removed and re-added
+externally. See `queue/worker.ts` for the corrected implementation and the comment explaining
+why the original approach didn't work.
+
