@@ -11,6 +11,16 @@ in a Next.js dashboard with real Google OAuth login.
 > but running it live requires you to supply your own Google OAuth credentials, a Slack app,
 > and infra (Redis/Postgres/Elasticsearch — provided via `docker-compose.yml`). Nothing is
 > mocked in the logic; the *credentials* are the only thing you must bring.
+## 🔗 Live Demo
+
+[ample-wholeness-production.up.railway.app](https://ample-wholeness-production.up.railway.app/)
+
+> ⚠️ Email **sending** is disabled on this live deployment — Railway's free tier blocks
+> outbound SMTP ports (25/465/587) by default. Scheduled emails will move to "Failed" with
+> a `Connection timeout` once the worker attempts the send; this is expected, not a bug
+> (see [Hosting Notes](#hosting-notes-deployed-on-railway--vercel)). Everything else —
+> Google login, the dashboard, scheduling, Slack OAuth + live rate-limit alerts, and
+> search — works identically to local.
 
 ## Table of Contents
 
