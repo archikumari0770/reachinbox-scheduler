@@ -12,6 +12,28 @@ in a Next.js dashboard with real Google OAuth login.
 > and infra (Redis/Postgres/Elasticsearch — provided via `docker-compose.yml`). Nothing is
 > mocked in the logic; the *credentials* are the only thing you must bring.
 
+## Table of Contents
+
+- [Architecture](#1-architecture)
+- [No Cron, Ever](#2-no-cron-ever)
+- [Persistence Across Restarts](#3-persistence-across-restarts-no-lost--no-duplicate-sends)
+- [Concurrency, Throttling, and Hourly Rate Limits](#4-concurrency-throttling-and-hourly-rate-limits)
+- [Slack Notification on Rate-Limit Hit](#5-slack-notification-on-rate-limit-hit)
+- [Search (Elasticsearch)](#6-search-elasticsearch)
+- [Live BullMQ Dashboard](#7-live-bullmq-dashboard)
+- [Running It](#running-it)
+  - [Prerequisites](#prerequisites)
+  - [1. Infra](#1-infra)
+  - [2. Set Up Ethereal Email](#2-set-up-ethereal-email-fake-smtp)
+  - [3. Backend](#3-backend)
+  - [4. Frontend](#4-frontend)
+- [Features Implemented](#features-implemented)
+  - [Backend](#backend)
+  - [Frontend](#frontend)
+- [Key Environment Variables](#key-environment-variables-backend-env)
+- [Hosting Notes](#hosting-notes-deployed-on-railway--vercel)
+- [A Real Bug Found and Fixed](#a-real-bug-found-and-fixed-during-manual-testing)
+
 ---
 
 ## 1. Architecture
