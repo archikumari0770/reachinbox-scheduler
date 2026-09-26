@@ -90,7 +90,8 @@ export function googleLoginUrl(): string {
 }
 
 export function slackConnectUrl(): string {
-  return `${API_URL}/api/slack/authorize`;
+  const token = localStorage.getItem("reachinbox_token"); // confirm this key name first
+  return `${API_URL}/api/slack/authorize?token=${encodeURIComponent(token ?? "")}`;
 }
 
 export async function disconnectSlack(): Promise<void> {
